@@ -106,11 +106,58 @@ def diffusion_loss(
     model: torch.nn.Module,
     x0: torch.Tensor,
     t: torch.Tensor,
+    labels: torch.Tensor, 
     sqrt_alpha_bars: torch.Tensor,
     sqrt_one_minus_alpha_bars: torch.Tensor,
     noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_t, noise = q_sample(x0, t, sqrt_alpha_bars, sqrt_one_minus_alpha_bars, noise)
-    pred_noise = model(x_t, t)
+    pred_noise = model(x_t, t, labels)
     loss = ((noise - pred_noise) ** 2).mean()
     return loss
+
+@torch.no_grad()
+def p_sample_loop(
+    model: torch.nn.Module,
+    sample_shape: tuple[int, int, int, int],
+    labels: torch.Tensor,
+    guidance_scale: float,
+    sqrt_alpha_bars: torch.Tensor,
+    sqrt_one_minus_alpha_bars: torch.Tensor,
+    posterior_mean_coef_x0: torch.Tensor,
+    posterior_mean_coef_xt: torch.Tensor,
+    posterior_variance: torch.Tensor,
+) -> torch.Tensor:
+    device = next(model.parameters()).device
+    labels = labels.to(device)
+    num_steps = sqrt_alpha_bars.shape[0]
+    x_t = torch.randn(sample_shape, device=device)
+    for step in reversed(range(num_steps)):
+        # 要构造一个[B]的t
+        t = torch.full((sample_shape[0],), step, device=device, dtype=torch.long)
+        pred_noise = predict_noise_cfg(model, x_t, t, labels, guidance_scale)
+        x_prev, _ = p_sample_step(
+            x_t,
+            t,
+            pred_noise,
+            sqrt_alpha_bars,
+            sqrt_one_minus_alpha_bars, 
+            posterior_mean_coef_x0,
+            posterior_mean_coef_xt,
+            posterior_variance
+            )
+        x_t = x_prev
+    return x_t
+
+def predict_noise_cfg(
+    model: torch.nn.Module,
+    x_t: torch.Tensor,
+    t: torch.Tensor,
+    labels: torch.Tensor,
+    guidance_scale: float,
+) -> torch.Tensor:
+    pred_noise_cond = model(x_t, t, labels)
+    null_labels = torch.full_like(labels, model.label_embedding.null_class_id)
+    pred_noise_uncond = model(x_t, t, null_labels)
+    pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_cond - pred_noise_uncond)
+    return pred_noise
