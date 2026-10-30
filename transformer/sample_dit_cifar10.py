@@ -4,6 +4,7 @@ import argparse
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 
@@ -50,6 +51,7 @@ import torch
 from torchvision.utils import save_image
 
 from diffusion_zsq import (
+    ddim_sample_loop,
     make_beta_schedule,
     p_sample_loop,
     precompute_diffusion_items,
@@ -72,6 +74,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--samples-per-class", type=int, default=1)
     parser.add_argument("--guidance-scale", type=float, default=4.0)
+    parser.add_argument(
+        "--sampler",
+        choices=["ddpm", "ddim"],
+        default="ddim",
+        help="Sampling algorithm. DDIM supports fewer denoising steps.",
+    )
+    parser.add_argument(
+        "--num-sample-steps",
+        type=int,
+        default=50,
+        help="Number of DDIM denoising steps; ignored for DDPM.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -94,6 +108,7 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model_config = checkpoint["model_config"]
     diffusion_config = checkpoint["diffusion_config"]
+    prediction_type = checkpoint.get("prediction_type", "epsilon")
     class_names = checkpoint.get("class_names", [str(index) for index in range(10)])
 
     model = DiT(**model_config)
@@ -124,32 +139,63 @@ def main() -> None:
         int(model_config["image_height"]),
         int(model_config["image_width"]),
     )
+    num_train_steps = int(diffusion_config["num_diffusion_steps"])
+    sampling_steps = (
+        num_train_steps if args.sampler == "ddpm" else args.num_sample_steps
+    )
 
     print(
         f"checkpoint={args.checkpoint} epoch={checkpoint['epoch']} "
         f"device={device} samples={labels.shape[0]} "
-        f"steps={diffusion_config['num_diffusion_steps']} "
+        f"sampler={args.sampler} steps={sampling_steps} "
+        f"prediction_type={prediction_type} "
         f"guidance_scale={args.guidance_scale}",
         flush=True,
     )
-    samples = p_sample_loop(
-        model,
-        sample_shape,
-        labels,
-        args.guidance_scale,
-        sqrt_alpha_bars,
-        sqrt_one_minus_alpha_bars,
-        posterior_mean_coef_x0,
-        posterior_mean_coef_xt,
-        posterior_variance,
-    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    sample_start = time.perf_counter()
 
-    # DiT predicts x_0 in [-1,1]; save_image expects [0,1].
+    if args.sampler == "ddpm":
+        samples = p_sample_loop(
+            model,
+            sample_shape,
+            labels,
+            args.guidance_scale,
+            sqrt_alpha_bars,
+            sqrt_one_minus_alpha_bars,
+            posterior_mean_coef_x0,
+            posterior_mean_coef_xt,
+            posterior_variance,
+            prediction_type=prediction_type,
+        )
+    else:
+        samples = ddim_sample_loop(
+            model,
+            sample_shape,
+            labels,
+            args.guidance_scale,
+            sqrt_alpha_bars,
+            sqrt_one_minus_alpha_bars,
+            args.num_sample_steps,
+            prediction_type=prediction_type,
+        )
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    sample_seconds = time.perf_counter() - sample_start
+
+    # The sampler returns x_0 in [-1,1]; save_image expects [0,1].
     samples = (samples.clamp(-1.0, 1.0) + 1.0) / 2.0
     args.output.parent.mkdir(parents=True, exist_ok=True)
     save_image(samples.cpu(), args.output, nrow=args.samples_per_class)
 
     print(f"saved={args.output}", flush=True)
+    print(
+        f"sampling_seconds={sample_seconds:.3f} "
+        f"seconds_per_step={sample_seconds / sampling_steps:.4f}",
+        flush=True,
+    )
     print(
         "row_labels=" + ", ".join(class_names[:num_classes]),
         flush=True,

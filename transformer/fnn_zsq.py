@@ -42,4 +42,3 @@ class XORNetwork(torch.nn.Module):
     def __init__(self, ):
         super().__init__()
         self.hidden_weight = torch.nn.Parameter([[3.0, 4.0], [2.0, 3.0]])
-        self.hidden_bias = 

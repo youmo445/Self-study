@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-diffusion-steps", type=int, default=1000)
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=2e-2)
+    parser.add_argument(
+        "--prediction-type",
+        choices=["epsilon", "x0", "v"],
+        default="epsilon",
+        help="Training target predicted by the DiT output head.",
+    )
 
     parser.add_argument("--patch-size", type=int, default=4)
     parser.add_argument("--hidden-dim", type=int, default=256)
@@ -257,6 +263,7 @@ def train_one_epoch(
             labels,
             sqrt_alpha_bars,
             sqrt_one_minus_alpha_bars,
+            prediction_type=args.prediction_type,
         )
         loss.backward()
 
@@ -298,6 +305,7 @@ def evaluate(
     num_diffusion_steps: int,
     validation_seed: int,
     max_steps: int | None,
+    prediction_type: str,
 ) -> float:
     model.eval()
     loss_sum = 0.0
@@ -333,6 +341,7 @@ def evaluate(
             sqrt_alpha_bars,
             sqrt_one_minus_alpha_bars,
             noise,
+            prediction_type=prediction_type,
         )
         loss_sum += loss.item() * batch_size
         sample_count += batch_size
@@ -400,6 +409,11 @@ def main() -> None:
             raise ValueError("The checkpoint model_config does not match the requested model.")
         if checkpoint["diffusion_config"] != diffusion_config:
             raise ValueError("The checkpoint diffusion_config does not match the requested schedule.")
+        checkpoint_prediction_type = checkpoint.get("prediction_type", "epsilon")
+        if checkpoint_prediction_type != args.prediction_type:
+            raise ValueError(
+                "The checkpoint prediction_type does not match the requested target."
+            )
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         move_optimizer_state_to_device(optimizer, device)
@@ -436,6 +450,7 @@ def main() -> None:
         flush=True,
     )
     print(f"diffusion_steps={args.num_diffusion_steps}", flush=True)
+    print(f"prediction_type={args.prediction_type}", flush=True)
     print(f"tensorboard={tensorboard_dir}", flush=True)
 
     latest_path = args.output_dir / "latest.pt"
@@ -464,6 +479,7 @@ def main() -> None:
                 args.num_diffusion_steps,
                 args.seed + 10_000,
                 args.max_validation_steps,
+                args.prediction_type,
             )
             scheduler.step()
 
@@ -485,6 +501,7 @@ def main() -> None:
                 "scheduler_state_dict": scheduler.state_dict(),
                 "model_config": model_config,
                 "diffusion_config": diffusion_config,
+                "prediction_type": args.prediction_type,
                 "class_names": class_names,
                 "normalization_mean": DIFFUSION_MEAN,
                 "normalization_std": DIFFUSION_STD,
@@ -514,6 +531,7 @@ def main() -> None:
             args.num_diffusion_steps,
             args.seed + 20_000,
             args.max_validation_steps,
+            args.prediction_type,
         )
         writer.add_scalar("test/loss", test_loss, 0)
         writer.flush()
